@@ -4,6 +4,8 @@ This repository contains a simple Python application that lets you schedule post
 
 ## Overview
 
+[An example Google Sheet can be found here.](https://docs.google.com/spreadsheets/d/1TjDAWDzI0UfU2CsvsULdd-ATAmGMSaD7aIs4RZVJG7g/edit?usp=sharing)
+
 The scheduler reads a Google Sheet with the following structure:
 
 * **Connections tab** – each row defines a Bluesky account to post from. Columns:
