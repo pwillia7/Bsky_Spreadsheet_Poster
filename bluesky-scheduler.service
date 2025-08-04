@@ -1,0 +1,12 @@
+[Unit]
+Description=Bluesky Scheduler
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ptkwilliams/repos/Bsky_Spreadsheet_Poster
+ExecStart=/usr/bin/env python bluesky_scheduler.py --sheet-id 1Lq_ZLbMhsKPmooaNTqQyhkEY8JNhBMjiG8U4u2IQ52g --creds /home/ptkwilliams/repos/Bsky_Spreadsheet_Poster/bluesky-autoposter-f743d321d668.json
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
