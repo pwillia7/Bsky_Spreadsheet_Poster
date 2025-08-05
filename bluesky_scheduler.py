@@ -100,11 +100,12 @@ import csv
 import datetime as dt
 import io
 import logging
+import json
 import os
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
+import re
 import requests
 from dateutil import parser as dateparser  # type: ignore
 import pytz  # type: ignore
@@ -121,7 +122,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 DEFAULT_TIMEZONE = "America/Chicago"
@@ -229,6 +230,9 @@ def create_post_record(
             "createdAt": now_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
         },
     }
+    facets = extract_hashtag_facets(text)
+    if facets:
+        record["record"]["facets"] = facets
     if embed is not None:
         record["record"]["embed"] = embed
 
@@ -354,10 +358,18 @@ def load_image(media_field: str) -> Tuple[bytes, str]:
 
 
 def parse_datetime(date_str: str, tz_name: str) -> dt.datetime:
-    """Parse an ISO 8601 date/time string into an aware ``datetime``.
+    """Parse a date/time string into a timezone‑aware ``datetime``.
+
+    ``dateutil.parser.parse`` can handle a variety of human‑friendly formats,
+    including ISO 8601 (``2025-08-05T10:30:00``) and US‑style formats
+    (``8/4/2025 14:40:00``).  To avoid misinterpreting day/month order on
+    ambiguous numeric dates, ``dayfirst`` is explicitly set to ``False``,
+    meaning the first number is treated as the month.  If your sheet uses
+    day‑first formats (e.g. ``04/08/2025`` for 4 August 2025), set
+    ``dayfirst=True`` here or use ISO 8601 dates instead.
 
     Args:
-        date_str: The date/time string (e.g. ``2025-08-05T10:30:00``).
+        date_str: The date/time string.
         tz_name: Timezone name (e.g. ``America/Chicago``).  If blank,
           ``DEFAULT_TIMEZONE`` is used.
 
@@ -365,13 +377,27 @@ def parse_datetime(date_str: str, tz_name: str) -> dt.datetime:
         A timezone‑aware ``datetime`` object.
     """
     tz = pytz.timezone(tz_name or DEFAULT_TIMEZONE)
-    dt_naive = dateparser.parse(date_str)
+    # dayfirst=False ensures that ambiguous dates like "8/4/2025" are
+    # interpreted as month/day/year.  Yearfirst defaults to False.
+    dt_naive = dateparser.parse(date_str, dayfirst=False)
     if not dt_naive.tzinfo:
         dt_local = tz.localize(dt_naive)
     else:
         dt_local = dt_naive.astimezone(tz)
     return dt_local
 
+def extract_hashtag_facets(text: str) -> List[Dict]:
+    """Extract hashtag facets from post text with byte ranges."""
+    facets = []
+    for match in re.finditer(r"#(\w+)", text):
+        tag = match.group(1)
+        byte_start = len(text[:match.start()].encode("utf-8"))
+        byte_end = byte_start + len(match.group(0).encode("utf-8"))
+        facets.append({
+            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+            "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag}]
+        })
+    return facets
 
 def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.datetime, dry_run: bool = False) -> None:
     """Process scheduled posts for a single account.
@@ -393,6 +419,8 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
         logger.warning("Worksheet %s missing 'Datetime' column", conn.account_name)
         return
     content_idx = headers.index("Content") if "Content" in headers else None
+    # Optional columns
+    hashtags_idx = headers.index("Hashtags") if "Hashtags" in headers else None
     media_idx = headers.index("Media") if "Media" in headers else None
     tz_idx = headers.index("Timezone") if "Timezone" in headers else None
     status_idx = headers.index("Status") if "Status" in headers else None
@@ -415,11 +443,33 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
         if scheduled_dt > now:
             continue
 
-        text = row[content_idx] if content_idx is not None and len(row) > content_idx else ""
+        # Build the text by combining content and hashtags (if provided).
+        raw_text = row[content_idx] if content_idx is not None and len(row) > content_idx else ""
+        hashtags = row[hashtags_idx] if hashtags_idx is not None and len(row) > hashtags_idx else ""
+        text_parts: List[str] = []
+        if raw_text:
+            text_parts.append(str(raw_text).strip())
+        if hashtags:
+            text_parts.append(str(hashtags).strip())
+        text = "\n".join(part for part in text_parts if part)
         media = row[media_idx] if media_idx is not None and len(row) > media_idx else ""
 
         logger.info("Posting row %d for account %s: %s", row_i + 2, conn.account_name, text)
         # Ensure we have DID and session
+        embed = None
+        # Sanitize text and enforce character limit
+        text = text.encode("utf-8", errors="replace").decode("utf-8")
+
+        if len(text) > 300:
+            logger.warning("Post text is over 300 characters (%d). It may be rejected.", len(text))
+
+        # Debug output for post
+        logger.debug("Final post text:\n%s", text)
+        logger.debug("Text length: %d", len(text))
+        
+        if embed:
+            logger.debug("Embed payload:\n%s", json.dumps(embed, indent=2))
+
         try:
             if conn.did is None:
                 conn.did = resolve_handle(conn.handle)
@@ -443,7 +493,12 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
                 post_uri = "dry_run"
                 cid = "dry_run"
             else:
-                result = create_post_record(conn.did, access_jwt, text, embed=embed)
+                try:
+                    result = create_post_record(conn.did, access_jwt, text, embed=embed)
+                except requests.HTTPError as e:
+                    logger.error("HTTPError while posting: %s", e)
+                    logger.error("Response body: %s", e.response.text)
+                    raise
                 post_uri = result.get("uri")
                 cid = result.get("cid")
             post_url = None

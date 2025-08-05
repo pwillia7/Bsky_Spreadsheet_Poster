@@ -1,0 +1,11 @@
+for f in *.png; do
+  out="compressed_${f%.png}.webp"
+  q=90
+  magick "$f" -define webp:method=6 -quality $q "$out"
+  while [ $(stat -c%s "$out") -gt 1000000 ] && [ $q -gt 10 ]; do
+    ((q-=5))
+    magick "$f" -define webp:method=6 -quality $q "$out"
+  done
+  echo "$out created at quality $q with size $(stat -c%s "$out") bytes"
+done
+
