@@ -17,6 +17,7 @@ The scheduler reads a Google Sheet with the following structure:
   - **Datetime** – ISO 8601 date/time when the post should be published (e.g. `2025-08-05T10:30:00`). US‑style formats like `8/4/2025 14:40:00` also work; ambiguous dates are interpreted as month/day/year.
   - **Timezone** – (optional) IANA timezone (e.g. `America/Chicago`). Defaults to `America/Chicago` when blank.
   - **Content** – text of your post (up to 300 characters).
+  - **Hashtags** - List of hashtags to be posted with the post content.
   - **Media** – (optional) publicly accessible URL or local path to an image (JPEG or PNG). The script uploads the image as a blob before posting:contentReference[oaicite:0]{index=0}.
   - **Status** – leave blank; the scheduler updates it to `Posted` or `Error`.
   - **PostURL** – filled in after posting with the Bluesky URL.
