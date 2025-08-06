@@ -113,12 +113,18 @@ import pytz  # type: ignore
 try:
     import gspread  # type: ignore
     from google.oauth2.service_account import Credentials  # type: ignore
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseDownload
 except ImportError:
     # gspread and google-auth are only required when the script is run in a
     # configured environment.  We avoid raising immediately so that the
     # remainder of this module remains importable for static analysis.
     gspread = None  # type: ignore
     Credentials = None  # type: ignore
+    build = None # type: ignore
+    HttpError = None # type: ignore
+    MediaIoBaseDownload = None # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -200,6 +206,55 @@ def upload_blob(image_content: bytes, access_jwt: str, *, mime_type: str = "imag
     return blob
 
 
+def get_post_uri_from_url(post_url: str) -> Optional[str]:
+    """Extract the post URI from a Bluesky post URL."""
+    # The post URL is in the format https://bsky.app/profile/{handle}/post/{post_id}
+    # The post URI is in the format at://{did}/app.bsky.feed.post/{post_id}
+    match = re.search(r"/post/(\w+)", post_url)
+    if not match:
+        return None
+    post_id = match.group(1)
+
+    # To get the DID, we need to resolve the handle from the URL
+    handle_match = re.search(r"/profile/([^/]+)", post_url)
+    if not handle_match:
+        return None
+    handle = handle_match.group(1)
+
+    try:
+        did = resolve_handle(handle)
+        return f"at://{did}/app.bsky.feed.post/{post_id}"
+    except RuntimeError:
+        return None
+
+def get_post_engagement(post_uri: str, *, base_url: str = BLUESKY_BASE_URL) -> Dict[str, int]:
+    """Get the engagement counts for a given post."""
+    url = f"{base_url}/xrpc/app.bsky.feed.getPosts"
+    params = {"uris": [post_uri]}
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if not data.get("posts"):
+        return {"likes": 0, "reposts": 0, "replies": 0}
+
+    post = data["posts"][0]
+    return {
+        "likes": post.get("likeCount", 0),
+        "reposts": post.get("repostCount", 0),
+        "replies": post.get("replyCount", 0),
+    }
+
+def get_follower_count(handle: str, *, base_url: str = BLUESKY_BASE_URL) -> int:
+    """Get the follower count for a given actor."""
+    url = f"{base_url}/xrpc/app.bsky.actor.getProfile"
+    params = {"actor": handle}
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("followersCount", 0)
+
+
 def create_post_record(
     did: str,
     access_jwt: str,
@@ -262,10 +317,14 @@ class GoogleSheetClient:
         if gspread is None or Credentials is None:
             raise ImportError("gspread and google-auth are required to use GoogleSheetClient."
                               "  Install them via pip and try again.")
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
         creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
         gc = gspread.authorize(creds)
         self.sheet = gc.open_by_key(sheet_id)
+        self.drive_service = build("drive", "v3", credentials=creds)
 
     def get_worksheet(self, name: str):
         try:
@@ -321,16 +380,99 @@ class GoogleSheetClient:
             cell.value = val
         ws.update_cells(cell_list)
 
+    def update_statistics(self, stats_data: Dict[str, any]) -> None:
+        """Update the statistics summary for an account."""
+        try:
+            ws = self.sheet.worksheet("Statistics")
+        except gspread.WorksheetNotFound:
+            ws = self.sheet.add_worksheet(title="Statistics", rows=100, cols=20)
+            headers = [
+                "Account Name", "Total Posts", "Total Likes", "Total Reposts",
+                "Total Replies", "Average Likes per Post", "Average Reposts per Post",
+                "Average Replies per Post", "Follower Count", "Last Updated"
+            ]
+            ws.append_row(headers)
 
-def load_image(media_field: str) -> Tuple[bytes, str]:
+        account_name = stats_data["Account Name"]
+        try:
+            cell = ws.find(account_name)
+            row_index = cell.row
+            # Read existing data
+            existing_data = ws.row_values(row_index)
+            total_posts = int(existing_data[1]) + 1
+            total_likes = int(existing_data[2]) + stats_data["Likes"]
+            total_reposts = int(existing_data[3]) + stats_data["Reposts"]
+            total_replies = int(existing_data[4]) + stats_data["Replies"]
+        except gspread.CellNotFound:
+            row_index = len(ws.get_all_values()) + 1
+            total_posts = 1
+            total_likes = stats_data["Likes"]
+            total_reposts = stats_data["Reposts"]
+            total_replies = stats_data["Replies"]
+
+        # Calculate averages
+        avg_likes = total_likes / total_posts if total_posts > 0 else 0
+        avg_reposts = total_reposts / total_posts if total_posts > 0 else 0
+        avg_replies = total_replies / total_posts if total_posts > 0 else 0
+
+        row_values = [
+            account_name,
+            total_posts,
+            total_likes,
+            total_reposts,
+            total_replies,
+            f"{avg_likes:.2f}",
+            f"{avg_reposts:.2f}",
+            f"{avg_replies:.2f}",
+            stats_data["Follower Count"],
+            stats_data["Last Updated"],
+        ]
+
+        if 'cell' in locals():
+            ws.update(f"A{row_index}", [row_values])
+        else:
+            ws.append_row(row_values)
+
+
+def _get_gdrive_file_id(url: str) -> Optional[str]:
+    """Extracts the Google Drive file ID from a URL."""
+    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def load_image(media_field: str, sheet_client: GoogleSheetClient) -> Tuple[bytes, str]:
     """Load image content and detect its MIME type.
 
-    The ``media_field`` may be a URL or a local file path.  The function
-    downloads the content if it looks like a URL; otherwise it reads from
-    disk.  Supported file extensions are JPEG (.jpg/.jpeg) and PNG (.png).
+    The ``media_field`` may be a URL (including Google Drive), or a local file
+    path.  The function downloads the content if it looks like a URL;
+    otherwise it reads from disk.  Supported file extensions are JPEG
+    (.jpg/.jpeg) and PNG (.png).
 
     Returns a tuple of (binary content, mime type).
     """
+    gdrive_file_id = _get_gdrive_file_id(media_field)
+
+    if gdrive_file_id:
+        try:
+            file_metadata = sheet_client.drive_service.files().get(
+                fileId=gdrive_file_id, fields="mimeType, name"
+            ).execute()
+            mime_type = file_metadata.get("mimeType", "image/jpeg")
+            request = sheet_client.drive_service.files().get_media(fileId=gdrive_file_id)
+            content = io.BytesIO()
+            downloader = MediaIoBaseDownload(content, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            return content.getvalue(), mime_type
+        except HttpError as error:
+            raise RuntimeError(f"Could not download from Google Drive: {error}")
+
     if media_field.lower().startswith("http://") or media_field.lower().startswith("https://"):
         resp = requests.get(media_field, timeout=60)
         resp.raise_for_status()
@@ -477,7 +619,7 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
             embed = None
             if media:
                 # Load and upload image
-                img_bytes, mime_type = load_image(media)
+                img_bytes, mime_type = load_image(media, sheet)
                 blob = upload_blob(img_bytes, access_jwt, mime_type=mime_type)
                 embed = {
                     "$type": "app.bsky.embed.images",
@@ -515,6 +657,26 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
                 # The post ID is after the last slash in URI
                 post_id = post_uri.split("/")[-1] if isinstance(post_uri, str) else cid
                 post_url = f"https://bsky.app/profile/{conn.handle}/post/{post_id}"
+
+            # Get statistics
+            follower_count = get_follower_count(conn.handle)
+            post_uri_for_engagement = get_post_uri_from_url(post_url)
+            if post_uri_for_engagement:
+                engagement = get_post_engagement(post_uri_for_engagement)
+            else:
+                engagement = {"likes": 0, "reposts": 0, "replies": 0}
+
+            # Update statistics tab
+            stats_data = {
+                "Account Name": conn.account_name,
+                "Likes": engagement["likes"],
+                "Reposts": engagement["reposts"],
+                "Replies": engagement["replies"],
+                "Follower Count": follower_count,
+                "Last Updated": dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat(timespec="seconds"),
+            }
+            sheet.update_statistics(stats_data)
+
             updates = {
                 "Status": "Posted",
                 "PostURL": post_url or "",
