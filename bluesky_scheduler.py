@@ -320,11 +320,6 @@ class GoogleSheetClient:
     """Wrapper around gspread to simplify sheet operations."""
 
     def __init__(self, sheet_id: str, creds_path: str) -> None:
-        if gspread is None or Credentials is None:
-            raise ImportError(
-                "gspread and google-auth are required to use GoogleSheetClient."
-                "  Install them via pip and try again."
-            )
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.readonly",
