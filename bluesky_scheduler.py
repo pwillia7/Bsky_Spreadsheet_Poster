@@ -227,11 +227,12 @@ def get_post_uri_from_url(post_url: str) -> Optional[str]:
     except RuntimeError:
         return None
 
-def get_post_engagement(post_uri: str, *, base_url: str = BLUESKY_BASE_URL) -> Dict[str, int]:
+def get_post_engagement(post_uri: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL) -> Dict[str, int]:
     """Get the engagement counts for a given post."""
     url = f"{base_url}/xrpc/app.bsky.feed.getPosts"
     params = {"uris": [post_uri]}
-    resp = requests.get(url, params=params, timeout=30)
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
@@ -245,11 +246,12 @@ def get_post_engagement(post_uri: str, *, base_url: str = BLUESKY_BASE_URL) -> D
         "replies": post.get("replyCount", 0),
     }
 
-def get_follower_count(handle: str, *, base_url: str = BLUESKY_BASE_URL) -> int:
+def get_follower_count(handle: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL) -> int:
     """Get the follower count for a given actor."""
     url = f"{base_url}/xrpc/app.bsky.actor.getProfile"
     params = {"actor": handle}
-    resp = requests.get(url, params=params, timeout=30)
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     return data.get("followersCount", 0)
@@ -659,10 +661,10 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
                 post_url = f"https://bsky.app/profile/{conn.handle}/post/{post_id}"
 
             # Get statistics
-            follower_count = get_follower_count(conn.handle)
+            follower_count = get_follower_count(conn.handle, access_jwt)
             post_uri_for_engagement = get_post_uri_from_url(post_url)
             if post_uri_for_engagement:
-                engagement = get_post_engagement(post_uri_for_engagement)
+                engagement = get_post_engagement(post_uri_for_engagement, access_jwt)
             else:
                 engagement = {"likes": 0, "reposts": 0, "replies": 0}
 
