@@ -18,7 +18,7 @@ The scheduler reads a Google Sheet with the following structure:
   - **Timezone** – (optional) IANA timezone (e.g. `America/Chicago`). Defaults to `America/Chicago` when blank.
   - **Content** – text of your post (up to 300 characters).
   - **Hashtags** - List of hashtags to be posted with the post content.
-  - **Media** – (optional) publicly accessible URL or local path to an image (JPEG or PNG). The script uploads the image as a blob before posting:contentReference[oaicite:0]{index=0}.
+  - **Media** – (optional) publicly accessible URL, Google Drive URL, or local path to an image (JPEG or PNG). The script uploads the image as a blob before posting.
   - **Status** – leave blank; the scheduler updates it to `Posted` or `Error`.
   - **PostURL** – filled in after posting with the Bluesky URL.
   - **PostedAt** – the actual UTC time the post was created.
@@ -36,11 +36,19 @@ The scheduler uses the AT Protocol endpoints directly. For reference, the `atpro
 
 1. Visit the [Google Cloud console](https://console.cloud.google.com/).
 2. Create a new project or select an existing one.
-3. Navigate to *APIs & Services → Dashboard* and click **Enable APIs and Services**. Search for **Google Sheets API** and enable it.
+3. Navigate to *APIs & Services → Dashboard* and click **Enable APIs and Services**. Search for and enable both the **Google Sheets API** and the **Google Drive API**.
 4. Go to *APIs & Services → Credentials*, click **Create credentials → Service account**.
 5. Give it a name (e.g. *Bluesky Scheduler SA*). You don’t need to assign any roles here.
 6. After creating the service account, go to the **Keys** tab. Click **Add key → Create new key**, choose **JSON**, and download the key file. This file contains your credentials; keep it safe.
 7. In your Google Sheet, share the document with the service account’s email address (found in the service account details or in the downloaded JSON under `client_email`). Grant it **Editor** access.
+
+### Using Google Drive for Media
+
+If you plan to use Google Drive to host your media, you will also need to share the folder containing your images and videos with the service account.
+
+1. Create a folder in your Google Drive to store the media for your posts.
+2. Share this folder with the service account's email address. Grant it **Viewer** access.
+3. When you want to include media from this folder in a post, copy the shareable link for the file and paste it into the `Media` column in your spreadsheet.
 
 ## Setup
 
