@@ -112,6 +112,7 @@ import pytz  # type: ignore
 
 try:
     import gspread  # type: ignore
+    from gspread.exceptions import CellNotFound
     from google.oauth2.service_account import Credentials  # type: ignore
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -405,7 +406,7 @@ class GoogleSheetClient:
             total_likes = int(existing_data[2]) + stats_data["Likes"]
             total_reposts = int(existing_data[3]) + stats_data["Reposts"]
             total_replies = int(existing_data[4]) + stats_data["Replies"]
-        except gspread.CellNotFound:
+        except CellNotFound:
             row_index = len(ws.get_all_values()) + 1
             total_posts = 1
             total_likes = stats_data["Likes"]
