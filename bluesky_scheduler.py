@@ -117,18 +117,146 @@ try:
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaIoBaseDownload
-except ImportError as e:
-    if "gspread" in str(e) or "google-auth" in str(e):
-        # gspread and google-auth are only required when the script is run in a
-        # configured environment.  We avoid raising immediately so that the
-        # remainder of this module remains importable for static analysis.
-        gspread = None  # type: ignore
-        Credentials = None  # type: ignore
-        build = None # type: ignore
-        HttpError = None # type: ignore
-        MediaIoBaseDownload = None # type: ignore
-    else:
-        raise e
+except ImportError:
+    # gspread and google-auth are only required when the script is run in a
+    # configured environment.  We avoid raising immediately so that the
+    # remainder of this module remains importable for static analysis.
+    gspread = None  # type: ignore
+    Credentials = None  # type: ignore
+    build = None # type: ignore
+    HttpError = None # type: ignore
+    MediaIoBaseDownload = None # type: ignore
+
+if gspread is None or Credentials is None:
+    # This block is only entered if the imports failed and the exception was
+    # caught.  In this case, we can't use the GoogleSheetClient, so we'll
+    # raise an error if the user tries to instantiate it.
+    class GoogleSheetClient:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "gspread and google-auth are required to use GoogleSheetClient."
+                "  Install them via pip and try again."
+            )
+else:
+    class GoogleSheetClient:
+        """Wrapper around gspread to simplify sheet operations."""
+
+        def __init__(self, sheet_id: str, creds_path: str) -> None:
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.readonly",
+            ]
+            creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+            gc = gspread.authorize(creds)
+            self.sheet = gc.open_by_key(sheet_id)
+            self.drive_service = build("drive", "v3", credentials=creds)
+
+        def get_worksheet(self, name: str):
+            try:
+                return self.sheet.worksheet(name)
+            except gspread.WorksheetNotFound:
+                # If the worksheet doesn't exist, create it with header row
+                ws = self.sheet.add_worksheet(title=name, rows=1000, cols=10)
+                return ws
+
+        def read_connections(self, worksheet_name: str = "Connections") -> List[ConnectionInfo]:
+            ws = self.get_worksheet(worksheet_name)
+            records = ws.get_all_records()
+            connections: List[ConnectionInfo] = []
+            for row in records:
+                account = row.get("Account") or row.get("account")
+                handle = row.get("Handle") or row.get("handle")
+                app_pw = row.get("AppPassword") or row.get("app_password")
+                if account and handle and app_pw:
+                    connections.append(ConnectionInfo(account, handle, app_pw))
+            return connections
+
+        def read_scheduled_posts(self, account_name: str) -> Tuple[List[str], List[List[str]]]:
+            ws = self.get_worksheet(account_name)
+            # Fetch header and all rows as lists; gspread returns cell values
+            rows = ws.get_all_values()
+            if not rows:
+                return [], []
+            headers = rows[0]
+            return headers, rows[1:]
+
+        def update_row(self, account_name: str, row_index: int, headers: List[str], updates: Dict[str, str]) -> None:
+            """Update specified columns in a row.  Row index is 1‑based and should
+            refer to the sheet row (including header).  headers is the list of
+            column names as returned from ``read_scheduled_posts``.  updates maps
+            column names to new values.
+            """
+            ws = self.get_worksheet(account_name)
+            # gspread uses 1‑based row/column indexing; row_index is offset from
+            # header (0‑based).  So the actual row number in the sheet is row_index+2.
+            sheet_row = row_index + 2
+            # Build list of cells to update
+            cells = []
+            values = []
+            for col_name, value in updates.items():
+                try:
+                    col_num = headers.index(col_name) + 1
+                except ValueError:
+                    continue
+                cells.append((sheet_row, col_num, value))
+            # Batch update
+            cell_list = [ws.cell(r, c) for r, c, _ in cells]
+            for cell, (_, _, val) in zip(cell_list, cells):
+                cell.value = val
+            ws.update_cells(cell_list)
+
+        def update_statistics(self, stats_data: Dict[str, any]) -> None:
+            """Update the statistics summary for an account."""
+            try:
+                ws = self.sheet.worksheet("Statistics")
+            except gspread.WorksheetNotFound:
+                ws = self.sheet.add_worksheet(title="Statistics", rows=100, cols=20)
+                headers = [
+                    "Account Name", "Total Posts", "Total Likes", "Total Reposts",
+                    "Total Replies", "Average Likes per Post", "Average Reposts per Post",
+                    "Average Replies per Post", "Follower Count", "Last Updated"
+                ]
+                ws.append_row(headers)
+
+            account_name = stats_data["Account Name"]
+            try:
+                cell = ws.find(account_name)
+                row_index = cell.row
+                # Read existing data
+                existing_data = ws.row_values(row_index)
+                total_posts = int(existing_data[1]) + 1
+                total_likes = int(existing_data[2]) + stats_data["Likes"]
+                total_reposts = int(existing_data[3]) + stats_data["Reposts"]
+                total_replies = int(existing_data[4]) + stats_data["Replies"]
+            except CellNotFound:
+                row_index = len(ws.get_all_values()) + 1
+                total_posts = 1
+                total_likes = stats_data["Likes"]
+                total_reposts = stats_data["Reposts"]
+                total_replies = stats_data["Replies"]
+
+            # Calculate averages
+            avg_likes = total_likes / total_posts if total_posts > 0 else 0
+            avg_reposts = total_reposts / total_posts if total_posts > 0 else 0
+            avg_replies = total_replies / total_posts if total_posts > 0 else 0
+
+            row_values = [
+                account_name,
+                total_posts,
+                total_likes,
+                total_reposts,
+                total_replies,
+                f"{avg_likes:.2f}",
+                f"{avg_reposts:.2f}",
+                f"{avg_replies:.2f}",
+                stats_data["Follower Count"],
+                stats_data["Last Updated"],
+            ]
+
+            if 'cell' in locals():
+                ws.update(f"A{row_index}", [row_values])
+            else:
+                ws.append_row(row_values)
 
 
 logger = logging.getLogger(__name__)
