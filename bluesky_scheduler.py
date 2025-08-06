@@ -113,12 +113,18 @@ import pytz  # type: ignore
 try:
     import gspread  # type: ignore
     from google.oauth2.service_account import Credentials  # type: ignore
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseDownload
 except ImportError:
     # gspread and google-auth are only required when the script is run in a
     # configured environment.  We avoid raising immediately so that the
     # remainder of this module remains importable for static analysis.
     gspread = None  # type: ignore
     Credentials = None  # type: ignore
+    build = None # type: ignore
+    HttpError = None # type: ignore
+    MediaIoBaseDownload = None # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -262,10 +268,14 @@ class GoogleSheetClient:
         if gspread is None or Credentials is None:
             raise ImportError("gspread and google-auth are required to use GoogleSheetClient."
                               "  Install them via pip and try again.")
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
         creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
         gc = gspread.authorize(creds)
         self.sheet = gc.open_by_key(sheet_id)
+        self.drive_service = build("drive", "v3", credentials=creds)
 
     def get_worksheet(self, name: str):
         try:
@@ -322,15 +332,45 @@ class GoogleSheetClient:
         ws.update_cells(cell_list)
 
 
-def load_image(media_field: str) -> Tuple[bytes, str]:
+def _get_gdrive_file_id(url: str) -> Optional[str]:
+    """Extracts the Google Drive file ID from a URL."""
+    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"id=([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def load_image(media_field: str, sheet_client: GoogleSheetClient) -> Tuple[bytes, str]:
     """Load image content and detect its MIME type.
 
-    The ``media_field`` may be a URL or a local file path.  The function
-    downloads the content if it looks like a URL; otherwise it reads from
-    disk.  Supported file extensions are JPEG (.jpg/.jpeg) and PNG (.png).
+    The ``media_field`` may be a URL (including Google Drive), or a local file
+    path.  The function downloads the content if it looks like a URL;
+    otherwise it reads from disk.  Supported file extensions are JPEG
+    (.jpg/.jpeg) and PNG (.png).
 
     Returns a tuple of (binary content, mime type).
     """
+    gdrive_file_id = _get_gdrive_file_id(media_field)
+
+    if gdrive_file_id:
+        try:
+            file_metadata = sheet_client.drive_service.files().get(
+                fileId=gdrive_file_id, fields="mimeType, name"
+            ).execute()
+            mime_type = file_metadata.get("mimeType", "image/jpeg")
+            request = sheet_client.drive_service.files().get_media(fileId=gdrive_file_id)
+            content = io.BytesIO()
+            downloader = MediaIoBaseDownload(content, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            return content.getvalue(), mime_type
+        except HttpError as error:
+            raise RuntimeError(f"Could not download from Google Drive: {error}")
+
     if media_field.lower().startswith("http://") or media_field.lower().startswith("https://"):
         resp = requests.get(media_field, timeout=60)
         resp.raise_for_status()
@@ -477,7 +517,7 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
             embed = None
             if media:
                 # Load and upload image
-                img_bytes, mime_type = load_image(media)
+                img_bytes, mime_type = load_image(media, sheet)
                 blob = upload_blob(img_bytes, access_jwt, mime_type=mime_type)
                 embed = {
                     "$type": "app.bsky.embed.images",
