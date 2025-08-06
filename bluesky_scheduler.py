@@ -117,15 +117,18 @@ try:
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaIoBaseDownload
-except ImportError:
-    # gspread and google-auth are only required when the script is run in a
-    # configured environment.  We avoid raising immediately so that the
-    # remainder of this module remains importable for static analysis.
-    gspread = None  # type: ignore
-    Credentials = None  # type: ignore
-    build = None # type: ignore
-    HttpError = None # type: ignore
-    MediaIoBaseDownload = None # type: ignore
+except ImportError as e:
+    if "gspread" in str(e) or "google-auth" in str(e):
+        # gspread and google-auth are only required when the script is run in a
+        # configured environment.  We avoid raising immediately so that the
+        # remainder of this module remains importable for static analysis.
+        gspread = None  # type: ignore
+        Credentials = None  # type: ignore
+        build = None # type: ignore
+        HttpError = None # type: ignore
+        MediaIoBaseDownload = None # type: ignore
+    else:
+        raise e
 
 
 logger = logging.getLogger(__name__)
