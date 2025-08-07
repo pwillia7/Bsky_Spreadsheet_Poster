@@ -123,6 +123,41 @@ sudo systemctl enable --now bluesky-scheduler
 ```
 This will start the scheduler at boot and restart it automatically if it crashes.
 
+## Additional Features
+
+Beyond post scheduling, the script includes features for account management and growth.
+
+### Following New Users
+
+The script can automatically follow new users on behalf of your controlled accounts. This is a great way to grow your accounts' networks.
+
+To use this feature, run the script with the `--follow-new-users` flag, specifying the number of new users you want each of your accounts to follow:
+
+```bash
+python bluesky_scheduler.py --sheet-id YOUR_SHEET_ID --creds /path/to/service_account.json --follow-new-users 50
+```
+
+The script finds new users by searching for recent posts with the hashtags `#art`, `#photography`, and `#ai`. To avoid spamming, it ensures that:
+- Each new user is followed by only one of your controlled accounts.
+- It does not follow any of your own accounts.
+- It keeps track of users it has already followed in a separate `FollowedUsers` worksheet in your Google Sheet, so it won't follow the same user again.
+
+### Updating Account Statistics
+
+You can fetch and update statistics for your accounts, such as follower and post counts. This is useful for tracking account growth.
+
+To update the statistics, run the script with the `--update-stats` flag:
+
+```bash
+python bluesky_scheduler.py --sheet-id YOUR_SHEET_ID --creds /path/to/service_account.json --update-stats
+```
+
+This will create a new worksheet named `Statistics` in your Google Sheet (or clear the existing one) and populate it with the latest stats for each account in your `Connections` tab. The stats include:
+- Follower count
+- Following count
+- Total posts
+- Total likes, reposts, and replies on all posts made by the scheduler.
+
 ## Notes
 
 * The scheduler uploads images as blobs before including them in posts, as recommended by Bluesky’s API:contentReference[oaicite:0]{index=0}.
