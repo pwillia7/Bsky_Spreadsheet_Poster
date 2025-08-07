@@ -281,26 +281,40 @@ def get_post_engagement(
     }
 
 
-def search_posts(query: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL) -> List[str]:
-    """Search for posts and return a list of author DIDs.
+def search_posts(query: str, *, base_url: str = "https://public.api.bsky.app", limit: int = 100) -> List[str]:
+    """Search for posts and return a list of author DIDs, with pagination.
+
     Args:
         query: The search query (e.g., a hashtag).
-        access_jwt: Access token for the session.
         base_url: Base URL of the Bluesky service.
+        limit: The number of results to return per page.
+
     Returns:
         A list of author DIDs from the search results.
     """
     url = f"{base_url}/xrpc/app.bsky.feed.searchPosts"
-    params = {"q": query}
-    headers = {"Authorization": f"Bearer {access_jwt}"}
-    resp = requests.get(url, params=params, headers=headers, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
     dids = []
-    for post in data.get("posts", []):
-        author_did = post.get("author", {}).get("did")
-        if author_did:
-            dids.append(author_did)
+    cursor = None
+
+    # Fetch up to 3 pages of results to get a good number of candidates.
+    for _ in range(3):
+        params = {"q": query, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+
+        resp = requests.get(url, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for post in data.get("posts", []):
+            author_did = post.get("author", {}).get("did")
+            if author_did:
+                dids.append(author_did)
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break # No more pages
+
     return dids
 
 
@@ -822,20 +836,10 @@ def follow_new_users(sheet: GoogleSheetClient, connections: List[ConnectionInfo]
     search_queries = ["#art", "#photography", "#ai"]
     candidate_dids = set()
 
-    # Use the first connection to get an access token for searching
-    if not connections:
-        logger.error("No connections available to perform searches.")
-        return
-
-    first_conn = connections[0]
-    if first_conn.did is None:
-        first_conn.did = resolve_handle(first_conn.handle)
-    access_jwt = create_session(first_conn.did, first_conn.app_password)
-
     for query in search_queries:
         logger.info(f"Searching for posts with query: {query}")
         try:
-            dids = search_posts(query, access_jwt)
+            dids = search_posts(query)
             candidate_dids.update(dids)
         except Exception as e:
             logger.error(f"Error searching for posts with query '{query}': {e}")
@@ -891,6 +895,8 @@ def follow_new_users(sheet: GoogleSheetClient, connections: List[ConnectionInfo]
                         logger.error(f"Error following user {candidate}: {e}")
                 else:
                     logger.info(f"[DRY RUN] Would follow {candidate}")
+                    all_followed_dids.add(candidate)
+                    candidate_list.remove(candidate)
                     followed_count += 1
         except Exception as e:
             logger.error(f"An error occurred while processing account {conn.handle}: {e}")
