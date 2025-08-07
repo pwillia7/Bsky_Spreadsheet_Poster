@@ -280,6 +280,82 @@ def get_post_engagement(
     }
 
 
+def search_posts(query: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL) -> List[str]:
+    """Search for posts and return a list of author DIDs.
+    Args:
+        query: The search query (e.g., a hashtag).
+        access_jwt: Access token for the session.
+        base_url: Base URL of the Bluesky service.
+    Returns:
+        A list of author DIDs from the search results.
+    """
+    url = f"{base_url}/xrpc/app.bsky.feed.searchPosts"
+    params = {"q": query}
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    dids = []
+    for post in data.get("posts", []):
+        author_did = post.get("author", {}).get("did")
+        if author_did:
+            dids.append(author_did)
+    return dids
+
+
+def get_follows(actor_did: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL) -> List[str]:
+    """Get the list of DIDs that a user follows.
+    Args:
+        actor_did: The DID of the user.
+        access_jwt: Access token for the session.
+        base_url: Base URL of the Bluesky service.
+    Returns:
+        A list of DIDs of the users that the given user follows.
+    """
+    url = f"{base_url}/xrpc/app.bsky.graph.getFollows"
+    params = {"actor": actor_did}
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    dids = []
+    for follow in data.get("follows", []):
+        did = follow.get("did")
+        if did:
+            dids.append(did)
+    return dids
+
+
+def follow_user(follower_did: str, did_to_follow: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL) -> Dict:
+    """Follow a user.
+    Args:
+        follower_did: The DID of the account that is doing the following.
+        did_to_follow: The DID of the user to follow.
+        access_jwt: Access token for the session.
+        base_url: Base URL of the Bluesky service.
+    Returns:
+        The response from the createRecord call.
+    """
+    url = f"{base_url}/xrpc/com.atproto.repo.createRecord"
+    now_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+    record = {
+        "repo": follower_did,
+        "collection": "app.bsky.graph.follow",
+        "record": {
+            "$type": "app.bsky.graph.follow",
+            "subject": did_to_follow,
+            "createdAt": now_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_jwt}",
+    }
+    resp = requests.post(url, json=record, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def get_account_stats(
     actor: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL
 ) -> Dict:
@@ -361,6 +437,20 @@ class GoogleSheetClient:
             return [], []
         headers = rows[0]
         return headers, rows[1:]
+
+    def get_followed_users(self, worksheet_name: str = "FollowedUsers") -> set[str]:
+        ws = self.get_worksheet(worksheet_name)
+        all_values = ws.get_all_values()
+        if not all_values:
+            ws.append_row(["DID"])
+            return set()
+
+        # Assumes DIDs are in the first column, skipping the header
+        return set(row[0] for row in all_values[1:])
+
+    def add_followed_user(self, did: str, worksheet_name: str = "FollowedUsers") -> None:
+        ws = self.get_worksheet(worksheet_name)
+        ws.append_row([did])
 
     def update_row(self, account_name: str, row_index: int, headers: List[str], updates: Dict[str, str]) -> None:
         """Update specified columns in a row.  Row index is 1‑based and should
@@ -713,6 +803,91 @@ def update_statistics_sheet(sheet: GoogleSheetClient, connections: List[Connecti
             logger.error("Failed to update statistics for %s: %s", conn.account_name, e, exc_info=True)
 
 
+def follow_new_users(sheet: GoogleSheetClient, connections: List[ConnectionInfo], limit: int, dry_run: bool = False) -> None:
+    """Find and follow new users.
+
+    Args:
+        sheet: The GoogleSheetClient instance.
+        connections: A list of ConnectionInfo objects for the accounts.
+        limit: The maximum number of new users to follow per account.
+        dry_run: If True, do not actually follow users; only log actions.
+    """
+    logger.info(f"Starting to follow new users (limit: {limit} per account, dry_run: {dry_run})")
+
+    # Get the "FollowedUsers" worksheet and read the DIDs.
+    followed_dids = sheet.get_followed_users()
+
+    # Define search queries
+    search_queries = ["#art", "#photography", "#ai"]
+    candidate_dids = set()
+
+    # Use the first connection to get an access token for searching
+    if not connections:
+        logger.error("No connections available to perform searches.")
+        return
+
+    first_conn = connections[0]
+    if first_conn.did is None:
+        first_conn.did = resolve_handle(first_conn.handle)
+    access_jwt = create_session(first_conn.did, first_conn.app_password)
+
+    for query in search_queries:
+        logger.info(f"Searching for posts with query: {query}")
+        try:
+            dids = search_posts(query, access_jwt)
+            candidate_dids.update(dids)
+        except Exception as e:
+            logger.error(f"Error searching for posts with query '{query}': {e}")
+            continue
+
+    # Filter out our own accounts and already followed users
+    own_dids = set()
+    for conn in connections:
+        if conn.did is None:
+            conn.did = resolve_handle(conn.handle)
+        own_dids.add(conn.did)
+
+    candidate_dids -= own_dids
+    candidate_dids -= followed_dids
+
+    logger.info(f"Found {len(candidate_dids)} new potential users to follow.")
+
+    for conn in connections:
+        if conn.did is None:
+            # This should have been resolved already, but just in case
+            conn.did = resolve_handle(conn.handle)
+
+        access_jwt = create_session(conn.did, conn.app_password)
+
+        try:
+            following_dids = set(get_follows(conn.did, access_jwt))
+            candidates_for_this_account = list(candidate_dids - following_dids)
+
+            followed_count = 0
+            for did_to_follow in candidates_for_this_account:
+                if followed_count >= limit:
+                    break
+
+                if did_to_follow in followed_dids:
+                    continue
+
+                logger.info(f"Account '{conn.handle}' is attempting to follow {did_to_follow}")
+                if not dry_run:
+                    try:
+                        follow_user(conn.did, did_to_follow, access_jwt)
+                        logger.info(f"Successfully followed {did_to_follow}")
+                        sheet.add_followed_user(did_to_follow)
+                        followed_dids.add(did_to_follow)
+                        followed_count += 1
+                    except Exception as e:
+                        logger.error(f"Error following user {did_to_follow}: {e}")
+                else:
+                    logger.info(f"[DRY RUN] Would follow {did_to_follow}")
+                    followed_count += 1
+        except Exception as e:
+            logger.error(f"An error occurred while processing account {conn.handle}: {e}")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Schedule and post Bluesky updates from a Google Sheet.")
     parser.add_argument("--sheet-id", required=True, help="The ID of the Google Sheet.")
@@ -722,6 +897,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--interval", type=int, default=300, help="Polling interval in seconds when not using --run-once.")
     parser.add_argument("--dry-run", action="store_true", help="Do not post; just log actions.")
     parser.add_argument("--update-stats", action="store_true", help="Update the statistics sheet and exit.")
+    parser.add_argument(
+        "--follow-new-users",
+        type=int,
+        metavar="N",
+        help="Follow up to N new users per account based on hashtags.",
+    )
     args = parser.parse_args(argv)
 
     sheet = GoogleSheetClient(args.sheet_id, args.creds)
@@ -732,6 +913,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.update_stats:
         update_statistics_sheet(sheet, connections, dry_run=args.dry_run)
+        return 0
+
+    if args.follow_new_users:
+        follow_new_users(sheet, connections, args.follow_new_users, dry_run=args.dry_run)
         return 0
 
     tz = pytz.timezone(args.timezone)
