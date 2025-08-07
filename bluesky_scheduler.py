@@ -107,6 +107,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import re
 import requests
+import random
 from dateutil import parser as dateparser  # type: ignore
 import pytz  # type: ignore
 
@@ -815,7 +816,7 @@ def follow_new_users(sheet: GoogleSheetClient, connections: List[ConnectionInfo]
     logger.info(f"Starting to follow new users (limit: {limit} per account, dry_run: {dry_run})")
 
     # Get the "FollowedUsers" worksheet and read the DIDs.
-    followed_dids = sheet.get_followed_users()
+    followed_dids_from_sheet = sheet.get_followed_users()
 
     # Define search queries
     search_queries = ["#art", "#photography", "#ai"]
@@ -848,9 +849,14 @@ def follow_new_users(sheet: GoogleSheetClient, connections: List[ConnectionInfo]
         own_dids.add(conn.did)
 
     candidate_dids -= own_dids
-    candidate_dids -= followed_dids
+    candidate_dids -= followed_dids_from_sheet
 
     logger.info(f"Found {len(candidate_dids)} new potential users to follow.")
+
+    candidate_list = list(candidate_dids)
+    random.shuffle(candidate_list)
+
+    all_followed_dids = set(followed_dids_from_sheet)
 
     for conn in connections:
         if conn.did is None:
@@ -860,29 +866,31 @@ def follow_new_users(sheet: GoogleSheetClient, connections: List[ConnectionInfo]
         access_jwt = create_session(conn.did, conn.app_password)
 
         try:
-            following_dids = set(get_follows(conn.did, access_jwt))
-            candidates_for_this_account = list(candidate_dids - following_dids)
+            my_follows = set(get_follows(conn.did, access_jwt))
 
             followed_count = 0
-            for did_to_follow in candidates_for_this_account:
+
+            # Iterate over a copy of the list so we can modify it
+            for candidate in list(candidate_list):
                 if followed_count >= limit:
                     break
 
-                if did_to_follow in followed_dids:
+                if candidate in my_follows or candidate in all_followed_dids:
                     continue
 
-                logger.info(f"Account '{conn.handle}' is attempting to follow {did_to_follow}")
+                logger.info(f"Account '{conn.handle}' is attempting to follow {candidate}")
                 if not dry_run:
                     try:
-                        follow_user(conn.did, did_to_follow, access_jwt)
-                        logger.info(f"Successfully followed {did_to_follow}")
-                        sheet.add_followed_user(did_to_follow)
-                        followed_dids.add(did_to_follow)
+                        follow_user(conn.did, candidate, access_jwt)
+                        logger.info(f"Successfully followed {candidate}")
+                        sheet.add_followed_user(candidate)
+                        all_followed_dids.add(candidate)
+                        candidate_list.remove(candidate)
                         followed_count += 1
                     except Exception as e:
-                        logger.error(f"Error following user {did_to_follow}: {e}")
+                        logger.error(f"Error following user {candidate}: {e}")
                 else:
-                    logger.info(f"[DRY RUN] Would follow {did_to_follow}")
+                    logger.info(f"[DRY RUN] Would follow {candidate}")
                     followed_count += 1
         except Exception as e:
             logger.error(f"An error occurred while processing account {conn.handle}: {e}")
