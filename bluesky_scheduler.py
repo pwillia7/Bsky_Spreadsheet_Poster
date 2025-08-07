@@ -251,6 +251,62 @@ def create_post_record(
     return resp.json()
 
 
+def get_post_engagement(
+    post_uri: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL
+) -> Dict:
+    """Get engagement statistics for a specific post.
+
+    Args:
+        post_uri: The AT URI of the post.
+        access_jwt: Access token for the session.
+        base_url: Base URL of the Bluesky service.
+
+    Returns:
+        A dictionary with likeCount, repostCount, and replyCount.
+    """
+    url = f"{base_url}/xrpc/app.bsky.feed.getPostThread"
+    params = {"uri": post_uri}
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # The main post data is in thread.post
+    post_data = data.get("thread", {}).get("post", {})
+    return {
+        "likeCount": post_data.get("likeCount", 0),
+        "repostCount": post_data.get("repostCount", 0),
+        "replyCount": post_data.get("replyCount", 0),
+    }
+
+
+def get_account_stats(
+    actor: str, access_jwt: str, *, base_url: str = BLUESKY_BASE_URL
+) -> Dict:
+    """Get statistics for a Bluesky account.
+
+    Args:
+        actor: The DID or handle of the account.
+        access_jwt: Access token for the session.
+        base_url: Base URL of the Bluesky service.
+
+    Returns:
+        A dictionary with followersCount, followsCount, and postsCount.
+    """
+    url = f"{base_url}/xrpc/app.bsky.actor.getProfile"
+    params = {"actor": actor}
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    return {
+        "followersCount": data.get("followersCount", 0),
+        "followsCount": data.get("followsCount", 0),
+        "postsCount": data.get("postsCount", 0),
+    }
+
+
 @dataclass
 class ConnectionInfo:
     """Holds authentication information for a single Bluesky account."""
@@ -572,6 +628,91 @@ def process_account(sheet: GoogleSheetClient, conn: ConnectionInfo, now: dt.date
             sheet.update_row(conn.account_name, row_i, headers, updates)
 
 
+def _reconstruct_at_uri(post_url: str, did: str) -> Optional[str]:
+    """Reconstructs an AT URI from a public post URL and a DID."""
+    if not post_url or not did:
+        return None
+    match = re.search(r"/post/([a-zA-Z0-9_-]+)$", post_url)
+    if not match:
+        logger.warning("Could not extract post ID from URL: %s", post_url)
+        return None
+    post_id = match.group(1)
+    return f"at://{did}/app.bsky.feed.post/{post_id}"
+
+
+def update_statistics_sheet(sheet: GoogleSheetClient, connections: List[ConnectionInfo], dry_run: bool = False) -> None:
+    """Fetches engagement statistics and updates the 'Statistics' sheet."""
+    stats_ws = sheet.get_worksheet("Statistics")
+    if not dry_run:
+        stats_ws.clear()
+        headers = [
+            "Account", "Followers", "Following", "Total Posts", "Total Likes",
+            "Total Reposts", "Total Replies", "Last Updated",
+        ]
+        stats_ws.append_row(headers, value_input_option='USER_ENTERED')
+
+    for conn in connections:
+        logger.info("Fetching statistics for account: %s", conn.account_name)
+        try:
+            if conn.did is None:
+                conn.did = resolve_handle(conn.handle)
+            access_jwt = create_session(conn.did, conn.app_password)
+
+            # Fetch account stats
+            account_stats = get_account_stats(conn.did, access_jwt)
+            followers = account_stats.get("followersCount", 0)
+            following = account_stats.get("followsCount", 0)
+            total_posts = account_stats.get("postsCount", 0)
+
+            # Fetch and aggregate post engagement
+            total_likes, total_reposts, total_replies = 0, 0, 0
+            post_headers, post_rows = sheet.read_scheduled_posts(conn.account_name)
+
+            if post_headers:
+                try:
+                    posturl_idx = post_headers.index("PostURL")
+                    status_idx = post_headers.index("Status")
+                except ValueError:
+                    logger.warning("Worksheet %s missing 'PostURL' or 'Status' column", conn.account_name)
+                    continue
+
+                for row in post_rows:
+                    status = row[status_idx] if len(row) > status_idx else ""
+                    post_url = row[posturl_idx] if len(row) > posturl_idx else ""
+                    if status.lower() == "posted" and post_url:
+                        at_uri = _reconstruct_at_uri(post_url, conn.did)
+                        if at_uri:
+                            try:
+                                engagement = get_post_engagement(at_uri, access_jwt)
+                                total_likes += engagement.get("likeCount", 0)
+                                total_reposts += engagement.get("repostCount", 0)
+                                total_replies += engagement.get("replyCount", 0)
+                            except requests.HTTPError as e:
+                                if e.response.status_code == 404:
+                                    logger.warning("Post not found, skipping: %s", at_uri)
+                                else:
+                                    logger.error("HTTP error fetching engagement for %s: %s", at_uri, e)
+                        else:
+                            logger.warning("Could not reconstruct AT URI for post URL: %s", post_url)
+
+            logger.info(
+                f"Stats for {conn.account_name}: "
+                f"Followers={followers}, Following={following}, Posts={total_posts}, "
+                f"Likes={total_likes}, Reposts={total_reposts}, Replies={total_replies}"
+            )
+            if not dry_run:
+                now_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat(timespec="seconds")
+                stats_row = [
+                    conn.account_name, followers, following, total_posts,
+                    total_likes, total_reposts, total_replies, now_utc,
+                ]
+                stats_ws.append_row(stats_row, value_input_option='USER_ENTERED')
+                logger.info("Successfully updated statistics for %s", conn.account_name)
+
+        except Exception as e:
+            logger.error("Failed to update statistics for %s: %s", conn.account_name, e, exc_info=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Schedule and post Bluesky updates from a Google Sheet.")
     parser.add_argument("--sheet-id", required=True, help="The ID of the Google Sheet.")
@@ -580,14 +721,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--run-once", action="store_true", help="Process due posts once and exit (default).")
     parser.add_argument("--interval", type=int, default=300, help="Polling interval in seconds when not using --run-once.")
     parser.add_argument("--dry-run", action="store_true", help="Do not post; just log actions.")
+    parser.add_argument("--update-stats", action="store_true", help="Update the statistics sheet and exit.")
     args = parser.parse_args(argv)
 
-    tz = pytz.timezone(args.timezone)
     sheet = GoogleSheetClient(args.sheet_id, args.creds)
     connections = sheet.read_connections()
     if not connections:
         logger.error("No connections found in sheet.  Populate the 'Connections' worksheet.")
         return 1
+
+    if args.update_stats:
+        update_statistics_sheet(sheet, connections, dry_run=args.dry_run)
+        return 0
+
+    tz = pytz.timezone(args.timezone)
     if args.run_once:
         now = dt.datetime.now(tz)
         for conn in connections:
